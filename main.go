@@ -1,7 +1,9 @@
 package main
 
 import (
+	"bytes"
 	"crypto/tls"
+	"encoding/binary"
 	"fmt"
 	"io"
 	"log"
@@ -21,9 +23,12 @@ var (
 	craftyToken   = strings.TrimPrefix(getEnv("CRAFTY_TOKEN", ""), "Bearer ")
 	serverID      = getEnv("CRAFTY_SERVER_ID", "")
 	disconnectMsg = strings.ReplaceAll(getEnv("DISCONNECT_MESSAGE", "§a[AutoStart]\n§eOrdre envoyé à Crafty !\n§fRéessaie dans 15 secondes."), "\\n", "\n")
+	offlineMOTD   = getEnv("OFFLINE_MOTD", "§c[Hors Ligne] §fRejoins pour démarrer le serveur")
+	serverFavicon = getEnv("SERVER_FAVICON", "") // Optionnel: data:image/png;base64,...
 
 	isOnline   bool
 	isOnlineMu sync.RWMutex
+	isStarting bool
 	httpClient *http.Client
 )
 
@@ -39,6 +44,30 @@ func getEnv(key, fallback string) string {
 		return val
 	}
 	return fallback
+}
+
+// --- Helpers d'encodage du protocole Minecraft ---
+
+func readVarInt(r io.Reader) (int, error) {
+	var num int
+	var count int
+	for {
+		var b [1]byte
+		_, err := r.Read(b[:])
+		if err != nil {
+			return 0, err
+		}
+		value := int(b[0] & 0x7F)
+		num |= value << (7 * count)
+		count++
+		if count > 5 {
+			return 0, fmt.Errorf("VarInt trop grand")
+		}
+		if (b[0] & 0x80) == 0 {
+			break
+		}
+	}
+	return num, nil
 }
 
 func writeVarInt(value int) []byte {
@@ -57,19 +86,19 @@ func writeVarInt(value int) []byte {
 	return buf
 }
 
-func sendMinecraftKick(conn net.Conn, message string) {
-	jsonMsg := fmt.Sprintf(`{"text":"%s"}`, message)
-	strBytes := []byte(jsonMsg)
-	strLen := writeVarInt(len(strBytes))
-
-	packetData := append([]byte{0x00}, strLen...) // 0x00 = Disconnect (Login)
-	packetData = append(packetData, strBytes...)
-
-	packetLen := writeVarInt(len(packetData))
-	fullPacket := append(packetLen, packetData...)
-
-	conn.Write(fullPacket)
+func writeString(s string) []byte {
+	b := []byte(s)
+	return append(writeVarInt(len(b)), b...)
 }
+
+func sendPacket(conn net.Conn, packetID byte, data []byte) error {
+	body := append([]byte{packetID}, data...)
+	length := writeVarInt(len(body))
+	_, err := conn.Write(append(length, body...))
+	return err
+}
+
+// --- Déclencheur Crafty ---
 
 func triggerStart() {
 	url := fmt.Sprintf("%s/api/v2/servers/%s/action/start_server", craftyURL, serverID)
@@ -99,9 +128,110 @@ func checkTarget() bool {
 	return false
 }
 
-func handleConnection(client net.Conn) {
-	defer client.Close()
+// --- Répondeur MOTD / Ping & Kick ---
 
+func handleOfflineHandshake(client net.Conn) {
+	defer client.Close()
+	client.SetDeadline(time.Now().Add(5 * time.Second))
+
+	// 1. Lire le paquet Handshake
+	_, err := readVarInt(client) // Length
+	if err != nil {
+		return
+	}
+	packetID, err := readVarInt(client)
+	if err != nil || packetID != 0x00 {
+		return
+	}
+
+	_ = readVarInt(client) // Protocol Version
+	hostLen, err := readVarInt(client)
+	if err != nil {
+		return
+	}
+	hostBuf := make([]byte, hostLen)
+	io.ReadFull(client, hostBuf)
+
+	var port uint16
+	binary.Read(client, binary.BigEndian, &port)
+
+	nextState, err := readVarInt(client) // 1 pour Status (Ping), 2 pour Login
+	if err != nil {
+		return
+	}
+
+	// --- ÉTAPE 1 : PING DE LA LISTE DE SERVEURS (Status) ---
+	if nextState == 1 {
+		// Attendre le paquet Status Request (0x00)
+		_, _ = readVarInt(client)
+		_, _ = readVarInt(client)
+
+		motd := offlineMOTD
+		versionName := "§cFabric Hors Ligne"
+		if isStarting {
+			motd = "§6[Démarrage...] §eFabric charge, réessaie dans quelques secondes !"
+			versionName = "§6Démarrage en cours..."
+		}
+
+		// Format JSON du Status Response
+		iconJson := ""
+		if serverFavicon != "" {
+			iconJson = fmt.Sprintf(`,"favicon":"%s"`, serverFavicon)
+		}
+
+		jsonResponse := fmt.Sprintf(`{
+			"version": {"name": "%s", "protocol": 765},
+			"players": {"max": 20, "online": 0, "sample": []},
+			"description": {"text": "%s"}%s
+		}`, versionName, motd, iconJson)
+
+		sendPacket(client, 0x00, writeString(jsonResponse))
+
+		// Lire le paquet Ping et renvoyer Pong
+		_, err = readVarInt(client)
+		if err == nil {
+			pingID, err := readVarInt(client)
+			if err == nil && pingID == 0x01 {
+				payload := make([]byte, 8)
+				io.ReadFull(client, payload)
+				sendPacket(client, 0x01, payload)
+			}
+		}
+		return
+	}
+
+	// --- ÉTAPE 2 : TENTATIVE DE CONNEXION DU JOUEUR (Login Start) ---
+	if nextState == 2 {
+		// Lire paquet Login Start (0x00)
+		_, _ = readVarInt(client)
+		loginPacketID, _ := readVarInt(client)
+
+		username := "Joueur Inconnu"
+		if loginPacketID == 0x00 {
+			nameLen, err := readVarInt(client)
+			if err == nil && nameLen < 32 {
+				nameBuf := make([]byte, nameLen)
+				io.ReadFull(client, nameBuf)
+				username = string(nameBuf)
+			}
+		}
+
+		playerIP := client.RemoteAddr().String()
+		log.Printf("[CONNEXION] Tentative de connexion de [%s] (IP: %s)", username, playerIP)
+
+		// Déclencher Crafty
+		isStarting = true
+		go triggerStart()
+
+		// Envoi du paquet Disconnect (Login Mode - Packet ID 0x00)
+		jsonKick := fmt.Sprintf(`{"text":"%s"}`, disconnectMsg)
+		sendPacket(client, 0x00, writeString(jsonKick))
+	}
+}
+
+// --- Gestionnaire de connexions principal ---
+
+func handleConnection(client net.Conn) {
 	isOnlineMu.RLock()
 	online := isOnline
 	isOnlineMu.RUnlock()
@@ -112,22 +242,24 @@ func handleConnection(client net.Conn) {
 			isOnlineMu.Lock()
 			isOnline = false
 			isOnlineMu.Unlock()
+			client.Close()
 			return
 		}
 		defer target.Close()
+		defer client.Close()
 
+		// Tunnel TCP natif bidirectionnel ultra-rapide
 		go io.Copy(target, client)
 		io.Copy(client, target)
 		return
 	}
 
-	go triggerStart()
-
-	time.Sleep(50 * time.Millisecond)
-	sendMinecraftKick(client, disconnectMsg)
+	// Si le serveur est éteint, on traite la demande via le protocole Minecraft
+	handleOfflineHandshake(client)
 }
 
 func main() {
+	// Surveillance en arrière-plan
 	go func() {
 		for {
 			isOnlineMu.RLock()
@@ -138,6 +270,7 @@ func main() {
 				if checkTarget() {
 					isOnlineMu.Lock()
 					isOnline = true
+					isStarting = false
 					isOnlineMu.Unlock()
 					log.Println("[PROXY] Fabric est EN LIGNE ! Mode relais TCP natif actif.")
 				}
