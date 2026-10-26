@@ -145,7 +145,7 @@ func writeVarInt(w io.Writer, value int) error {
 		if value != 0 {
 			b |= 0x80
 		}
-		_ , err := w.Write([]byte{b})
+		_, err := w.Write([]byte{b})
 		if err != nil {
 			return err
 		}
@@ -179,8 +179,12 @@ func sendPacket(w io.Writer, packetID int, payload []byte) error {
 }
 
 func sendKickPacket(conn net.Conn, message string) {
+	cleanMsg := strings.ReplaceAll(message, "\\n", "\n")
+	jsonEscaped := strings.ReplaceAll(cleanMsg, "\n", "\\n")
+
+	jsonMsg := fmt.Sprintf(`{"text": "%s"}`, jsonEscaped)
+
 	var payload bytes.Buffer
-	jsonMsg := fmt.Sprintf(`{"text": "%s"}`, strings.ReplaceAll(message, "\n", "\\n"))
 	_ = writeString(&payload, jsonMsg)
 	_ = sendPacket(conn, 0x00, payload.Bytes())
 }
@@ -239,13 +243,13 @@ func triggerCraftyStart() {
 func handleConnection(client net.Conn) {
 	defer client.Close()
 
-	// 1. Lire la longueur globale du paquet Handshake
+	// 1. Longueur globale du paquet Handshake
 	_, err := readVarInt(client)
 	if err != nil {
 		return
 	}
 
-	// 2. Packet ID (doit être 0x00 pour Handshake)
+	// 2. Packet ID (0x00)
 	packetID, err := readVarInt(client)
 	if err != nil || packetID != 0x00 {
 		return
@@ -284,18 +288,30 @@ func handleConnection(client net.Conn) {
 		_, _ = readVarInt(client)
 		_, _ = readVarInt(client)
 
-		motd := os.Getenv("DISCONNECT_MESSAGE")
-		if motd == "" {
-			motd = "§aServeur Minecraft\n§eClique pour démarrer !"
+		var rawMotd string
+
+		// Afficher la maintenance directement dans la liste des serveurs
+		if os.Getenv("MAINTENANCE_MODE") == "true" {
+			rawMotd = os.Getenv("MAINTENANCE_MESSAGE")
+			if rawMotd == "" {
+				rawMotd = "§c[Maintenance]\n§fLe serveur est actuellement fermé."
+			}
+		} else {
+			rawMotd = os.Getenv("DISCONNECT_MESSAGE")
+			if rawMotd == "" {
+				rawMotd = "§aServeur Minecraft\n§eClique pour démarrer !"
+			}
 		}
+
+		motd := strings.ReplaceAll(rawMotd, "\\n", "\n")
 
 		statusJSON := map[string]interface{}{
 			"version": map[string]interface{}{
-				"name": "AutoStart 1.26.3",
+				"name":     "AutoStart 1.26.3",
 				"protocol": 765,
 			},
 			"players": map[string]interface{}{
-				"max": 20,
+				"max":    20,
 				"online": 0,
 			},
 			"description": map[string]interface{}{
@@ -328,7 +344,7 @@ func handleConnection(client net.Conn) {
 
 	if nextState == 2 {
 		// --- LOGIN START ---
-		_, _ = readVarInt(client) // packet length
+		_, _ = readVarInt(client)
 		loginPacketID, err := readVarInt(client)
 		if err != nil || loginPacketID != 0x00 {
 			return
@@ -339,7 +355,7 @@ func handleConnection(client net.Conn) {
 			username = "Inconnu"
 		}
 
-		// 1. Vérification Mode Maintenance
+		// 1. Mode Maintenance
 		if os.Getenv("MAINTENANCE_MODE") == "true" && !isPlayerAllowed(username) {
 			log.Printf("[MAINTENANCE] Connexion refusée pour %s", username)
 			logPlayerAction(username, "blocked_maintenance")
@@ -352,7 +368,7 @@ func handleConnection(client net.Conn) {
 			return
 		}
 
-		// 2. Vérification Whitelist
+		// 2. Whitelist
 		if !isPlayerAllowed(username) {
 			log.Printf("[WHITELIST] Joueur non autorisé : %s", username)
 			logPlayerAction(username, "blocked_whitelist")
