@@ -7,14 +7,7 @@ services:
     env_file:
       - .env
 
-  playit:
-    image: ghcr.io/playit-cloud/playit-agent:latest
-    container_name: playit-agent
-    restart: unless-stopped
-    network_mode: "host"
-    command: ["playit", "claim"]
-    volumes:
-      - playit_data:/etc/playit
+
 
 volumes:
   playit_data:
