@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"crypto/tls"
 	"encoding/binary"
 	"encoding/json"
@@ -23,8 +24,8 @@ var (
 	craftyToken   = strings.TrimPrefix(getEnv("CRAFTY_TOKEN", ""), "Bearer ")
 	serverID      = getEnv("CRAFTY_SERVER_ID", "")
 	
-	// Messages avec retours à la ligne échappés pour le JSON
-	disconnectMsg = strings.ReplaceAll(getEnv("DISCONNECT_MESSAGE", "§a[AutoStart]\\n§eOrdre envoyé à Crafty !\\n§fRéessaie dans 15 secondes."), "\n", "\\n")
+	// On garde les vrais \\n pour que le JSON Minecraft soit valide
+	disconnectMsg = getEnv("DISCONNECT_MESSAGE", "§a[AutoStart]\\n§eOrdre envoyé à Crafty !\\n§fRéessaie dans 15 secondes.")
 	offlineMOTD   = getEnv("OFFLINE_MOTD", "§c[Hors Ligne] §fRejoins pour démarrer le serveur")
 	serverFavicon = getEnv("SERVER_FAVICON", "")
 
@@ -51,13 +52,28 @@ type ProxyStats struct {
 	mu                 sync.Mutex
 }
 
+// --- ENREGISTREUR DE PAQUETS ---
+// Permet de lire le pseudo tout en mémorisant les paquets pour les renvoyer au serveur ensuite
+type RecordingConn struct {
+	net.Conn
+	Buffer bytes.Buffer
+	Record bool
+}
+
+func (r *RecordingConn) Read(p []byte) (int, error) {
+	n, err := r.Conn.Read(p)
+	if r.Record && n > 0 {
+		r.Buffer.Write(p[:n])
+	}
+	return n, err
+}
+
 func init() {
 	tr := &http.Transport{
 		TLSClientConfig: &tls.Config{InsecureSkipVerify: true},
 	}
 	httpClient = &http.Client{Transport: tr, Timeout: 5 * time.Second}
 
-	// Chargement des stats
 	data, err := os.ReadFile(statsFile)
 	if err == nil {
 		json.Unmarshal(data, &stats)
@@ -193,47 +209,68 @@ func checkTarget() bool {
 	return false
 }
 
-// --- Handshake & MOTD ---
+// --- Handler de Connexion Intelligente ---
 
-func handleOfflineHandshake(client net.Conn) {
-	defer client.Close()
-	client.SetDeadline(time.Now().Add(4 * time.Second))
+func handleConnection(client net.Conn) {
+	isMaintenance := strings.EqualFold(getEnv("MAINTENANCE_MODE", "false"), "true")
 
-	// 1. Handshake Packet
-	packetLen, err := readVarInt(client)
+	isOnlineMu.RLock()
+	online := isOnline
+	isOnlineMu.RUnlock()
+
+	// 1. Relais natif ULTRA-RAPIDE si le serveur est UP et qu'il n'y a PAS de maintenance
+	if online && !isMaintenance {
+		target, err := net.DialTimeout("tcp", net.JoinHostPort(targetHost, targetPort), 2*time.Second)
+		if err != nil {
+			isOnlineMu.Lock()
+			isOnline = false
+			isOnlineMu.Unlock()
+			client.Close()
+			return
+		}
+		defer target.Close()
+		defer client.Close()
+		go io.Copy(target, client)
+		io.Copy(client, target)
+		return
+	}
+
+	// 2. Mode Interception (Serveur hors ligne OU Maintenance active)
+	// On wrap la connexion pour enregistrer les paquets qu'on lit
+	rc := &RecordingConn{Conn: client, Record: true}
+	defer rc.Close()
+	rc.SetDeadline(time.Now().Add(4 * time.Second))
+
+	packetLen, err := readVarInt(rc)
 	if err != nil || packetLen <= 0 {
 		return
 	}
 
-	packetID, err := readVarInt(client)
+	packetID, err := readVarInt(rc)
 	if err != nil || packetID != 0x00 {
 		return
 	}
 
-	// Protocol version
-	_, err = readVarInt(client)
+	_, err = readVarInt(rc) // Protocol version
 	if err != nil {
 		return
 	}
 
-	// Hostname
-	hostLen, err := readVarInt(client)
+	hostLen, err := readVarInt(rc)
 	if err != nil || hostLen > 255 {
 		return
 	}
 	hostBuf := make([]byte, hostLen)
-	if _, err := io.ReadFull(client, hostBuf); err != nil {
+	if _, err := io.ReadFull(rc, hostBuf); err != nil {
 		return
 	}
 
-	// Port (uint16)
 	var port uint16
-	if err := binary.Read(client, binary.BigEndian, &port); err != nil {
+	if err := binary.Read(rc, binary.BigEndian, &port); err != nil {
 		return
 	}
 
-	// Next State (1 = Status/Ping, 2 = Login)
-	nextState, err := readVarInt(client)
+	nextState, err := readVarInt(rc)
 	if err != nil {
 		return
 	}
@@ -244,16 +281,14 @@ func handleOfflineHandshake(client net.Conn) {
 		stats.TotalPings++
 		stats.mu.Unlock()
 
-		_, _ = readVarInt(client) // Packet Length
-		_, _ = readVarInt(client) // Packet ID (0x00)
+		_, _ = readVarInt(rc)
+		_, _ = readVarInt(rc)
 
 		motd := offlineMOTD
 		versionName := "§cFabric Hors Ligne"
 		
-		isMaintenance := strings.EqualFold(getEnv("MAINTENANCE_MODE", "false"), "true")
-
 		if isMaintenance {
-			motd = strings.ReplaceAll(getEnv("MAINTENANCE_MESSAGE", "§c[Maintenance]\\n§fLe serveur est fermé."), "\\n", "\n")
+			motd = strings.ReplaceAll(getEnv("MAINTENANCE_MESSAGE", "§c[Maintenance]\\n§fLe serveur est fermé."), "\n", "\\n")
 			versionName = "§4Maintenance"
 		} else if isStarting {
 			motd = "§6[Démarrage...] §eFabric charge, réessaie dans 15s !"
@@ -267,16 +302,15 @@ func handleOfflineHandshake(client net.Conn) {
 
 		jsonResponse := fmt.Sprintf(`{"version":{"name":"%s","protocol":765},"players":{"max":20,"online":0},"description":{"text":"%s"}%s}`, versionName, motd, iconJson)
 
-		_ = sendPacket(client, 0x00, writeString(jsonResponse))
+		_ = sendPacket(rc, 0x00, writeString(jsonResponse))
 
-		// Traitement du paquet Ping (0x01)
-		pLen, err := readVarInt(client)
+		pLen, err := readVarInt(rc)
 		if err == nil && pLen > 0 {
-			pID, err := readVarInt(client)
+			pID, err := readVarInt(rc)
 			if err == nil && pID == 0x01 {
 				payload := make([]byte, 8)
-				if _, err := io.ReadFull(client, payload); err == nil {
-					_ = sendPacket(client, 0x01, payload)
+				if _, err := io.ReadFull(rc, payload); err == nil {
+					_ = sendPacket(rc, 0x01, payload)
 				}
 			}
 		}
@@ -285,31 +319,29 @@ func handleOfflineHandshake(client net.Conn) {
 
 	// --- STATE 2 : LOGIN (TENTATIVE DE REJOINDRE) ---
 	if nextState == 2 {
-		_, _ = readVarInt(client)
-		loginPacketID, _ := readVarInt(client)
+		_, _ = readVarInt(rc)
+		loginPacketID, _ := readVarInt(rc)
 
 		username := "Joueur"
 		if loginPacketID == 0x00 {
-			nameLen, err := readVarInt(client)
+			nameLen, err := readVarInt(rc)
 			if err == nil && nameLen > 0 && nameLen < 32 {
 				nameBuf := make([]byte, nameLen)
-				_, _ = io.ReadFull(client, nameBuf)
+				_, _ = io.ReadFull(rc, nameBuf)
 				username = string(nameBuf)
 			}
 		}
 
-		log.Printf("[CONNEXION] [%s] tente de se connecter via %s", username, client.RemoteAddr())
-
-		isMaintenance := strings.EqualFold(getEnv("MAINTENANCE_MODE", "false"), "true")
+		log.Printf("[CONNEXION] [%s] tente de se connecter", username)
 
 		// 1. Vérification Maintenance
 		if isMaintenance && !isPlayerAllowed(username) {
-			log.Printf("[MAINTENANCE] Refusé pour %s", username)
+			log.Printf("[MAINTENANCE] Refusé pour %s (Serveur en Ligne: %v)", username, online)
 			logPlayerAction(username, "blocked_maintenance")
 			
-			mMsg := getEnv("MAINTENANCE_MESSAGE", "§c[Maintenance]\\n§fLe serveur est fermé.")
+			mMsg := strings.ReplaceAll(getEnv("MAINTENANCE_MESSAGE", "§c[Maintenance]\\n§fLe serveur est fermé."), "\n", "\\n")
 			jsonKick := fmt.Sprintf(`{"text":"%s"}`, mMsg)
-			_ = sendPacket(client, 0x00, writeString(jsonKick))
+			_ = sendPacket(rc, 0x00, writeString(jsonKick))
 			return
 		}
 
@@ -319,43 +351,41 @@ func handleOfflineHandshake(client net.Conn) {
 			logPlayerAction(username, "blocked_whitelist")
 			
 			jsonKick := `{"text":"§cTu n'es pas dans la whitelist de ce serveur."}`
-			_ = sendPacket(client, 0x00, writeString(jsonKick))
+			_ = sendPacket(rc, 0x00, writeString(jsonKick))
 			return
 		}
 
-		// 3. Lancement
+		// 3. ADMIN AUTORISÉ (ou pas de maintenance/whitelist bloquante)
+		if online {
+			// Le serveur est allumé, on relie l'admin au serveur !
+			rc.SetDeadline(time.Time{}) // Retire la limite de temps pour le jeu
+			rc.Record = false           // Stop l'enregistrement
+			
+			target, err := net.DialTimeout("tcp", net.JoinHostPort(targetHost, targetPort), 2*time.Second)
+			if err != nil {
+				log.Printf("[PROXY] Erreur de relais: %v", err)
+				return
+			}
+			defer target.Close()
+
+			// On "vomit" tout ce qu'on a enregistré (Handshake + Login Start) vers le serveur
+			target.Write(rc.Buffer.Bytes())
+			
+			// Puis on passe en mode transparent
+			go io.Copy(target, rc.Conn)
+			io.Copy(rc.Conn, target)
+			return
+		}
+
+		// 4. Si serveur éteint -> Démarrage
 		logPlayerAction(username, "start_triggered")
 		isStarting = true
 		go triggerStart()
 
-		jsonKick := fmt.Sprintf(`{"text":"%s"}`, disconnectMsg)
-		_ = sendPacket(client, 0x00, writeString(jsonKick))
+		dMsg := strings.ReplaceAll(disconnectMsg, "\n", "\\n")
+		jsonKick := fmt.Sprintf(`{"text":"%s"}`, dMsg)
+		_ = sendPacket(rc, 0x00, writeString(jsonKick))
 	}
-}
-
-func handleConnection(client net.Conn) {
-	isOnlineMu.RLock()
-	online := isOnline
-	isOnlineMu.RUnlock()
-
-	if online {
-		target, err := net.Dial("tcp", net.JoinHostPort(targetHost, targetPort))
-		if err != nil {
-			isOnlineMu.Lock()
-			isOnline = false
-			isOnlineMu.Unlock()
-			client.Close()
-			return
-		}
-		defer target.Close()
-		defer client.Close()
-
-		go io.Copy(target, client)
-		io.Copy(client, target)
-		return
-	}
-
-	handleOfflineHandshake(client)
 }
 
 func main() {
