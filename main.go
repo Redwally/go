@@ -1,11 +1,8 @@
 package main
 
 import (
-	"bytes"
 	"crypto/tls"
-	"encoding/base64"
 	"encoding/binary"
-	"encoding/json"
 	"fmt"
 	"io"
 	"log"
@@ -17,250 +14,145 @@ import (
 	"time"
 )
 
-// --- STRUCTURES & STATISTIQUES ---
-
-type PlayerLog struct {
-	Username  string    `json:"username"`
-	Timestamp time.Time `json:"timestamp"`
-	Action    string    `json:"action"` // "start_triggered", "blocked_maintenance", "blocked_whitelist"
-}
-
-type ProxyStats struct {
-	TotalPings         uint64      `json:"total_pings"`
-	TotalStartTriggers uint64      `json:"total_start_triggers"`
-	History            []PlayerLog `json:"history"`
-	mu                 sync.Mutex
-}
-
 var (
-	stats         ProxyStats
-	statsFile     string
-	serverFavicon string
+	listenPort    = getEnv("LISTEN_PORT", "25565")
+	targetHost    = getEnv("TARGET_HOST", "172.17.0.1")
+	targetPort    = getEnv("TARGET_PORT", "25566")
+	craftyURL     = strings.TrimRight(getEnv("CRAFTY_URL", "https://172.17.0.1:8443"), "/")
+	craftyToken   = strings.TrimPrefix(getEnv("CRAFTY_TOKEN", ""), "Bearer ")
+	serverID      = getEnv("CRAFTY_SERVER_ID", "")
+	disconnectMsg = strings.ReplaceAll(getEnv("DISCONNECT_MESSAGE", "§a[AutoStart]\n§eOrdre envoyé à Crafty !\n§fRéessaie dans 15 secondes."), "\\n", "\n")
+	offlineMOTD   = getEnv("OFFLINE_MOTD", "§c[Hors Ligne] §fRejoins pour démarrer le serveur")
+	serverFavicon = getEnv("SERVER_FAVICON", "")
+
+	isOnline   bool
+	isOnlineMu sync.RWMutex
+	isStarting bool
+	httpClient *http.Client
 )
 
-// --- INITIALISATION DES STATS ET FAVICON ---
-
-func initStats() {
-	statsFile = os.Getenv("STATS_FILE")
-	if statsFile == "" {
-		statsFile = "stats.json"
+func init() {
+	tr := &http.Transport{
+		TLSClientConfig: &tls.Config{InsecureSkipVerify: true},
 	}
-
-	data, err := os.ReadFile(statsFile)
-	if err == nil {
-		_ = json.Unmarshal(data, &stats)
-		log.Printf("[STATS] Statistiques chargées depuis %s", statsFile)
-	} else {
-		stats.History = make([]PlayerLog, 0)
-		log.Println("[STATS] Fichier de statistiques initialisé.")
-	}
+	httpClient = &http.Client{Transport: tr, Timeout: 5 * time.Second}
 }
 
-func loadFavicon() {
-	envFav := os.Getenv("SERVER_FAVICON")
-	if envFav != "" {
-		serverFavicon = envFav
-		log.Println("[FAVICON] Icône chargée depuis la variable d'environnement.")
-		return
+func getEnv(key, fallback string) string {
+	if val := os.Getenv(key); val != "" {
+		return val
 	}
-
-	fileData, err := os.ReadFile("server-icon.png")
-	if err != nil {
-		log.Printf("[FAVICON] Aucun fichier server-icon.png trouvé : %v", err)
-		return
-	}
-	serverFavicon = "data:image/png;base64," + base64.StdEncoding.EncodeToString(fileData)
-	log.Println("[FAVICON] Icône chargée depuis server-icon.png !")
+	return fallback
 }
 
-func logPlayerAction(username, action string) {
-	stats.mu.Lock()
-	defer stats.mu.Unlock()
-
-	if action == "start_triggered" {
-		stats.TotalStartTriggers++
-	}
-
-	entry := PlayerLog{
-		Username:  username,
-		Timestamp: time.Now(),
-		Action:    action,
-	}
-	stats.History = append(stats.History, entry)
-	if len(stats.History) > 50 {
-		stats.History = stats.History[1:]
-	}
-
-	bytesData, err := json.MarshalIndent(stats, "", "  ")
-	if err == nil {
-		_ = os.WriteFile(statsFile, bytesData, 0644)
-	}
-}
-
-func isPlayerAllowed(username string) bool {
-	allowedList := os.Getenv("ALLOWED_PLAYERS")
-	if allowedList == "" {
-		return true
-	}
-
-	players := strings.Split(allowedList, ",")
-	for _, p := range players {
-		if strings.EqualFold(strings.TrimSpace(p), strings.TrimSpace(username)) {
-			return true
-		}
-	}
-	return false
-}
-
-// --- LOGIQUE PROTOCOLE MINECRAFT (VARINT & PACKETS) ---
+// --- Encodage / Décodage Protocole Minecraft ---
 
 func readVarInt(r io.Reader) (int, error) {
 	var num int
 	var count int
-	buf := make([]byte, 1)
-
 	for {
-		_, err := r.Read(buf)
+		var b [1]byte
+		_, err := r.Read(b[:])
 		if err != nil {
 			return 0, err
 		}
-		b := buf[0]
-		value := int(b & 0x7F)
+		value := int(b[0] & 0x7F)
 		num |= value << (7 * count)
 		count++
 		if count > 5 {
-			return 0, fmt.Errorf("varint trop grand")
+			return 0, fmt.Errorf("VarInt trop grand")
 		}
-		if (b & 0x80) == 0 {
+		if (b[0] & 0x80) == 0 {
 			break
 		}
 	}
 	return num, nil
 }
 
-func writeVarInt(w io.Writer, value int) error {
+func writeVarInt(value int) []byte {
+	var buf []byte
 	for {
 		b := byte(value & 0x7F)
 		value >>= 7
 		if value != 0 {
 			b |= 0x80
 		}
-		_, err := w.Write([]byte{b})
-		if err != nil {
-			return err
-		}
+		buf = append(buf, b)
 		if value == 0 {
 			break
 		}
 	}
-	return nil
+	return buf
 }
 
-func writeString(w io.Writer, s string) error {
-	bytesStr := []byte(s)
-	if err := writeVarInt(w, len(bytesStr)); err != nil {
-		return err
-	}
-	_, err := w.Write(bytesStr)
+func writeString(s string) []byte {
+	b := []byte(s)
+	return append(writeVarInt(len(b)), b...)
+}
+
+func sendPacket(conn net.Conn, packetID byte, data []byte) error {
+	body := append([]byte{packetID}, data...)
+	length := writeVarInt(len(body))
+	_, err := conn.Write(append(length, body...))
 	return err
 }
 
-func sendPacket(w io.Writer, packetID int, payload []byte) error {
-	var pBuf bytes.Buffer
-	_ = writeVarInt(&pBuf, packetID)
-	pBuf.Write(payload)
+// --- API Crafty ---
 
-	var frame bytes.Buffer
-	_ = writeVarInt(&frame, pBuf.Len())
-	frame.Write(pBuf.Bytes())
-
-	_, err := w.Write(frame.Bytes())
-	return err
-}
-
-func sendKickPacket(conn net.Conn, message string) {
-	cleanMsg := strings.ReplaceAll(message, "\\n", "\n")
-	jsonEscaped := strings.ReplaceAll(cleanMsg, "\n", "\\n")
-
-	jsonMsg := fmt.Sprintf(`{"text": "%s"}`, jsonEscaped)
-
-	var payload bytes.Buffer
-	_ = writeString(&payload, jsonMsg)
-	_ = sendPacket(conn, 0x00, payload.Bytes())
-}
-
-func extractUsername(r io.Reader) (string, error) {
-	strLen, err := readVarInt(r)
-	if err != nil || strLen > 16 || strLen < 3 {
-		return "Inconnu", err
-	}
-	buf := make([]byte, strLen)
-	if _, err := io.ReadFull(r, buf); err != nil {
-		return "Inconnu", err
-	}
-	return string(buf), nil
-}
-
-// --- API CRAFTY CONTROLLER ---
-
-func triggerCraftyStart() {
-	craftyURL := os.Getenv("CRAFTY_URL")
-	token := os.Getenv("CRAFTY_TOKEN")
-	serverID := os.Getenv("CRAFTY_SERVER_ID")
-
-	if craftyURL == "" || token == "" || serverID == "" {
-		log.Println("[CRAFTY] Variables d'environnement manquantes.")
-		return
-	}
-
-	url := fmt.Sprintf("%s/api/v4/servers/%s/action/start", craftyURL, serverID)
+func triggerStart() {
+	url := fmt.Sprintf("%s/api/v2/servers/%s/action/start_server", craftyURL, serverID)
 	req, err := http.NewRequest("POST", url, nil)
 	if err != nil {
-		log.Printf("[CRAFTY] Erreur de création de requête: %v", err)
 		return
 	}
-
-	req.Header.Set("Authorization", token)
+	req.Header.Set("Authorization", "Bearer "+craftyToken)
+	req.Header.Set("token", craftyToken)
 	req.Header.Set("Content-Type", "application/json")
 
-	tr := &http.Transport{
-		TLSClientConfig: &tls.Config{InsecureSkipVerify: true},
+	resp, err := httpClient.Do(req)
+	if err == nil {
+		resp.Body.Close()
+		log.Println("[CRAFTY] Ordre de démarrage accepté par Crafty")
+	} else {
+		log.Printf("[CRAFTY] Erreur envoi démarrage: %v", err)
 	}
-	client := &http.Client{Transport: tr, Timeout: 10 * time.Second}
-
-	resp, err := client.Do(req)
-	if err != nil {
-		log.Printf("[CRAFTY] Erreur d'appel API: %v", err)
-		return
-	}
-	defer resp.Body.Close()
-
-	log.Printf("[CRAFTY] Ordre de démarrage envoyé (Status: %d)", resp.StatusCode)
 }
 
-// --- PROXY HANDLER ---
+func checkTarget() bool {
+	conn, err := net.DialTimeout("tcp", net.JoinHostPort(targetHost, targetPort), 800*time.Millisecond)
+	if err == nil {
+		conn.Close()
+		return true
+	}
+	return false
+}
 
-func handleConnection(client net.Conn) {
+// --- Handshake & MOTD ---
+
+func handleOfflineHandshake(client net.Conn) {
 	defer client.Close()
+	client.SetDeadline(time.Now().Add(4 * time.Second))
 
-	// 1. Longueur globale du paquet Handshake
-	_, err := readVarInt(client)
-	if err != nil {
+	// 1. Handshake Packet
+	packetLen, err := readVarInt(client)
+	if err != nil || packetLen <= 0 {
 		return
 	}
 
-	// 2. Packet ID (0x00)
 	packetID, err := readVarInt(client)
 	if err != nil || packetID != 0x00 {
 		return
 	}
 
-	// 3. Version de protocole
-	_, _ = readVarInt(client)
+	// Protocol version
+	_, err = readVarInt(client)
+	if err != nil {
+		return
+	}
 
-	// 4. Hostname
+	// Hostname (ex: mc.redwally.fr)
 	hostLen, err := readVarInt(client)
-	if err != nil || hostLen > 1024 {
+	if err != nil || hostLen > 255 {
 		return
 	}
 	hostBuf := make([]byte, hostLen)
@@ -268,143 +160,130 @@ func handleConnection(client net.Conn) {
 		return
 	}
 
-	// 5. Port
+	// Port (uint16)
 	var port uint16
-	_ = binary.Read(client, binary.BigEndian, &port)
+	if err := binary.Read(client, binary.BigEndian, &port); err != nil {
+		return
+	}
 
-	// 6. Next State (1 = Status/Ping, 2 = Login)
+	// Next State (1 = Status/Ping, 2 = Login)
 	nextState, err := readVarInt(client)
 	if err != nil {
 		return
 	}
 
+	// --- STATE 1 : STATUS / PING ---
 	if nextState == 1 {
-		// --- STATUS / MOTD ---
-		stats.mu.Lock()
-		stats.TotalPings++
-		stats.mu.Unlock()
+		_, _ = readVarInt(client) // Packet Length
+		_, _ = readVarInt(client) // Packet ID (0x00)
 
-		// Paquet Request (0x00)
-		_, _ = readVarInt(client)
-		_, _ = readVarInt(client)
-
-		var rawMotd string
-
-		// Afficher la maintenance directement dans la liste des serveurs
-		if os.Getenv("MAINTENANCE_MODE") == "true" {
-			rawMotd = os.Getenv("MAINTENANCE_MESSAGE")
-			if rawMotd == "" {
-				rawMotd = "§c[Maintenance]\n§fLe serveur est actuellement fermé."
-			}
-		} else {
-			rawMotd = os.Getenv("DISCONNECT_MESSAGE")
-			if rawMotd == "" {
-				rawMotd = "§aServeur Minecraft\n§eClique pour démarrer !"
-			}
+		motd := offlineMOTD
+		versionName := "§cFabric Hors Ligne"
+		if isStarting {
+			motd = "§6[Démarrage...] §eFabric charge, réessaie dans 15s !"
+			versionName = "§6Démarrage..."
 		}
 
-		motd := strings.ReplaceAll(rawMotd, "\\n", "\n")
-
-		statusJSON := map[string]interface{}{
-			"version": map[string]interface{}{
-				"name":     "AutoStart 1.26.3",
-				"protocol": 765,
-			},
-			"players": map[string]interface{}{
-				"max":    20,
-				"online": 0,
-			},
-			"description": map[string]interface{}{
-				"text": motd,
-			},
-		}
-
+		iconJson := ""
 		if serverFavicon != "" {
-			statusJSON["favicon"] = serverFavicon
+			iconJson = fmt.Sprintf(`,"favicon":"%s"`, serverFavicon)
 		}
 
-		jsonBytes, _ := json.Marshal(statusJSON)
-		var responsePayload bytes.Buffer
-		_ = writeString(&responsePayload, string(jsonBytes))
-		_ = sendPacket(client, 0x00, responsePayload.Bytes())
+		jsonResponse := fmt.Sprintf(`{"version":{"name":"%s","protocol":765},"players":{"max":20,"online":0},"description":{"text":"%s"}%s}`, versionName, motd, iconJson)
 
-		// Paquet Ping/Pong
-		_, err = readVarInt(client)
-		if err == nil {
+		_ = sendPacket(client, 0x00, writeString(jsonResponse))
+
+		// Traitement du paquet Ping (0x01)
+		pLen, err := readVarInt(client)
+		if err == nil && pLen > 0 {
 			pID, err := readVarInt(client)
 			if err == nil && pID == 0x01 {
-				var pingPayload [8]byte
-				if _, err := io.ReadFull(client, pingPayload[:]); err == nil {
-					_ = sendPacket(client, 0x01, pingPayload[:])
+				payload := make([]byte, 8)
+				if _, err := io.ReadFull(client, payload); err == nil {
+					_ = sendPacket(client, 0x01, payload)
 				}
 			}
 		}
 		return
 	}
 
+	// --- STATE 2 : LOGIN (TENTATIVE DE REJOINDRre) ---
 	if nextState == 2 {
-		// --- LOGIN START ---
 		_, _ = readVarInt(client)
-		loginPacketID, err := readVarInt(client)
-		if err != nil || loginPacketID != 0x00 {
-			return
-		}
+		loginPacketID, _ := readVarInt(client)
 
-		username, err := extractUsername(client)
-		if err != nil {
-			username = "Inconnu"
-		}
-
-		// 1. Mode Maintenance
-		if os.Getenv("MAINTENANCE_MODE") == "true" && !isPlayerAllowed(username) {
-			log.Printf("[MAINTENANCE] Connexion refusée pour %s", username)
-			logPlayerAction(username, "blocked_maintenance")
-
-			maintMsg := os.Getenv("MAINTENANCE_MESSAGE")
-			if maintMsg == "" {
-				maintMsg = "§c[Maintenance]\n§fLe serveur est en cours de maintenance."
+		username := "Joueur"
+		if loginPacketID == 0x00 {
+			nameLen, err := readVarInt(client)
+			if err == nil && nameLen > 0 && nameLen < 32 {
+				nameBuf := make([]byte, nameLen)
+				_, _ = io.ReadFull(client, nameBuf)
+				username = string(nameBuf)
 			}
-			sendKickPacket(client, maintMsg)
-			return
 		}
 
-		// 2. Whitelist
-		if !isPlayerAllowed(username) {
-			log.Printf("[WHITELIST] Joueur non autorisé : %s", username)
-			logPlayerAction(username, "blocked_whitelist")
-			sendKickPacket(client, "§cTu n'es pas dans la whitelist de ce serveur.")
-			return
-		}
+		log.Printf("[CONNEXION] [%s] tente de se connecter via %s", username, client.RemoteAddr())
 
-		// 3. Déclenchement Auto-Start
-		log.Printf("[AUTOSTART] Lancement du serveur déclenché par : %s", username)
-		logPlayerAction(username, "start_triggered")
-		triggerCraftyStart()
+		isStarting = true
+		go triggerStart()
 
-		msg := os.Getenv("DISCONNECT_MESSAGE")
-		if msg == "" {
-			msg = "§a[AutoStart]\n§eOrdre de démarrage envoyé !"
-		}
-		sendKickPacket(client, msg)
+		jsonKick := fmt.Sprintf(`{"text":"%s"}`, disconnectMsg)
+		_ = sendPacket(client, 0x00, writeString(jsonKick))
 	}
 }
 
-func main() {
-	initStats()
-	loadFavicon()
+func handleConnection(client net.Conn) {
+	isOnlineMu.RLock()
+	online := isOnline
+	isOnlineMu.RUnlock()
 
-	port := os.Getenv("LISTEN_PORT")
-	if port == "" {
-		port = "25565"
+	if online {
+		target, err := net.Dial("tcp", net.JoinHostPort(targetHost, targetPort))
+		if err != nil {
+			isOnlineMu.Lock()
+			isOnline = false
+			isOnlineMu.Unlock()
+			client.Close()
+			return
+		}
+		defer target.Close()
+		defer client.Close()
+
+		go io.Copy(target, client)
+		io.Copy(client, target)
+		return
 	}
 
-	listener, err := net.Listen("tcp", ":"+port)
+	handleOfflineHandshake(client)
+}
+
+func main() {
+	go func() {
+		for {
+			isOnlineMu.RLock()
+			current := isOnline
+			isOnlineMu.RUnlock()
+
+			if !current {
+				if checkTarget() {
+					isOnlineMu.Lock()
+					isOnline = true
+					isStarting = false
+					isOnlineMu.Unlock()
+					log.Println("[PROXY] Fabric est EN LIGNE ! Mode relais TCP natif actif.")
+				}
+			}
+			time.Sleep(2 * time.Second)
+		}
+	}()
+
+	listener, err := net.Listen("tcp", ":"+listenPort)
 	if err != nil {
-		log.Fatalf("[PROXY] Impossible d'écouter sur le port %s: %v", port, err)
+		log.Fatalf("Erreur binding port: %v", err)
 	}
 	defer listener.Close()
 
-	log.Printf("[PROXY] En écoute sur le port :%s", port)
+	log.Printf("[INIT] Proxy Go démarré sur :%s -> %s:%s", listenPort, targetHost, targetPort)
 
 	for {
 		conn, err := listener.Accept()
