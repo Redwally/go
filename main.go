@@ -45,7 +45,7 @@ func getEnv(key, fallback string) string {
 	return fallback
 }
 
-// --- Helpers d'encodage du protocole Minecraft ---
+// --- Encodage / Décodage Protocole Minecraft ---
 
 func readVarInt(r io.Reader) (int, error) {
 	var num int
@@ -97,7 +97,7 @@ func sendPacket(conn net.Conn, packetID byte, data []byte) error {
 	return err
 }
 
-// --- Déclencheur Crafty ---
+// --- API Crafty ---
 
 func triggerStart() {
 	url := fmt.Sprintf("%s/api/v2/servers/%s/action/start_server", craftyURL, serverID)
@@ -127,52 +127,61 @@ func checkTarget() bool {
 	return false
 }
 
-// --- Répondeur MOTD / Ping & Kick ---
+// --- Handshake & MOTD ---
 
 func handleOfflineHandshake(client net.Conn) {
 	defer client.Close()
-	client.SetDeadline(time.Now().Add(5 * time.Second))
+	client.SetDeadline(time.Now().Add(4 * time.Second))
 
-	// 1. Lire le paquet Handshake
-	_, err := readVarInt(client) // Length
-	if err != nil {
+	// 1. Handshake Packet
+	packetLen, err := readVarInt(client)
+	if err != nil || packetLen <= 0 {
 		return
 	}
+
 	packetID, err := readVarInt(client)
 	if err != nil || packetID != 0x00 {
 		return
 	}
 
-	_, err = readVarInt(client) // Protocol Version
+	// Protocol version
+	_, err = readVarInt(client)
 	if err != nil {
 		return
 	}
+
+	// Hostname (ex: mc.redwally.fr)
 	hostLen, err := readVarInt(client)
-	if err != nil {
+	if err != nil || hostLen > 255 {
 		return
 	}
 	hostBuf := make([]byte, hostLen)
-	io.ReadFull(client, hostBuf)
+	if _, err := io.ReadFull(client, hostBuf); err != nil {
+		return
+	}
 
+	// Port (uint16)
 	var port uint16
-	binary.Read(client, binary.BigEndian, &port)
+	if err := binary.Read(client, binary.BigEndian, &port); err != nil {
+		return
+	}
 
-	nextState, err := readVarInt(client) // 1 pour Status (Ping), 2 pour Login
+	// Next State (1 = Status/Ping, 2 = Login)
+	nextState, err := readVarInt(client)
 	if err != nil {
 		return
 	}
 
-	// --- ÉTAPE 1 : PING DE LA LISTE DE SERVEURS (Status) ---
+	// --- STATE 1 : STATUS / PING ---
 	if nextState == 1 {
-		// Attendre le paquet Status Request (0x00)
-		_, _ = readVarInt(client)
-		_, _ = readVarInt(client)
+		_, _ = readVarInt(client) // Packet Length
+		_, _ = readVarInt(client) // Packet ID (0x00)
 
 		motd := offlineMOTD
 		versionName := "§cFabric Hors Ligne"
 		if isStarting {
-			motd = "§6[Démarrage...] §eFabric charge, réessaie dans quelques secondes !"
-			versionName = "§6Démarrage en cours..."
+			motd = "§6[Démarrage...] §eFabric charge, réessaie dans 15s !"
+			versionName = "§6Démarrage..."
 		}
 
 		iconJson := ""
@@ -180,54 +189,48 @@ func handleOfflineHandshake(client net.Conn) {
 			iconJson = fmt.Sprintf(`,"favicon":"%s"`, serverFavicon)
 		}
 
-		jsonResponse := fmt.Sprintf(`{
-			"version": {"name": "%s", "protocol": 765},
-			"players": {"max": 20, "online": 0, "sample": []},
-			"description": {"text": "%s"}%s
-		}`, versionName, motd, iconJson)
+		jsonResponse := fmt.Sprintf(`{"version":{"name":"%s","protocol":765},"players":{"max":20,"online":0},"description":{"text":"%s"}%s}`, versionName, motd, iconJson)
 
-		sendPacket(client, 0x00, writeString(jsonResponse))
+		_ = sendPacket(client, 0x00, writeString(jsonResponse))
 
-		// Lire le paquet Ping et renvoyer Pong
-		_, err = readVarInt(client)
-		if err == nil {
-			pingID, err := readVarInt(client)
-			if err == nil && pingID == 0x01 {
+		// Traitement du paquet Ping (0x01)
+		pLen, err := readVarInt(client)
+		if err == nil && pLen > 0 {
+			pID, err := readVarInt(client)
+			if err == nil && pID == 0x01 {
 				payload := make([]byte, 8)
-				io.ReadFull(client, payload)
-				sendPacket(client, 0x01, payload)
+				if _, err := io.ReadFull(client, payload); err == nil {
+					_ = sendPacket(client, 0x01, payload)
+				}
 			}
 		}
 		return
 	}
 
-	// --- ÉTAPE 2 : TENTATIVE DE CONNEXION DU JOUEUR (Login Start) ---
+	// --- STATE 2 : LOGIN (TENTATIVE DE REJOINDRre) ---
 	if nextState == 2 {
 		_, _ = readVarInt(client)
 		loginPacketID, _ := readVarInt(client)
 
-		username := "Joueur Inconnu"
+		username := "Joueur"
 		if loginPacketID == 0x00 {
 			nameLen, err := readVarInt(client)
-			if err == nil && nameLen < 32 {
+			if err == nil && nameLen > 0 && nameLen < 32 {
 				nameBuf := make([]byte, nameLen)
-				io.ReadFull(client, nameBuf)
+				_, _ = io.ReadFull(client, nameBuf)
 				username = string(nameBuf)
 			}
 		}
 
-		playerIP := client.RemoteAddr().String()
-		log.Printf("[CONNEXION] Tentative de connexion de [%s] (IP: %s)", username, playerIP)
+		log.Printf("[CONNEXION] [%s] tente de se connecter via %s", username, client.RemoteAddr())
 
 		isStarting = true
 		go triggerStart()
 
 		jsonKick := fmt.Sprintf(`{"text":"%s"}`, disconnectMsg)
-		sendPacket(client, 0x00, writeString(jsonKick))
+		_ = sendPacket(client, 0x00, writeString(jsonKick))
 	}
 }
-
-// --- Gestionnaire de connexions principal ---
 
 func handleConnection(client net.Conn) {
 	isOnlineMu.RLock()
