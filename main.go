@@ -3,6 +3,7 @@ package main
 import (
 	"crypto/tls"
 	"encoding/binary"
+	"encoding/json"
 	"fmt"
 	"io"
 	"log"
@@ -21,7 +22,9 @@ var (
 	craftyURL     = strings.TrimRight(getEnv("CRAFTY_URL", "https://172.17.0.1:8443"), "/")
 	craftyToken   = strings.TrimPrefix(getEnv("CRAFTY_TOKEN", ""), "Bearer ")
 	serverID      = getEnv("CRAFTY_SERVER_ID", "")
-	disconnectMsg = strings.ReplaceAll(getEnv("DISCONNECT_MESSAGE", "§a[AutoStart]\n§eOrdre envoyé à Crafty !\n§fRéessaie dans 15 secondes."), "\\n", "\n")
+	
+	// Messages avec retours à la ligne échappés pour le JSON
+	disconnectMsg = strings.ReplaceAll(getEnv("DISCONNECT_MESSAGE", "§a[AutoStart]\\n§eOrdre envoyé à Crafty !\\n§fRéessaie dans 15 secondes."), "\n", "\\n")
 	offlineMOTD   = getEnv("OFFLINE_MOTD", "§c[Hors Ligne] §fRejoins pour démarrer le serveur")
 	serverFavicon = getEnv("SERVER_FAVICON", "")
 
@@ -29,13 +32,38 @@ var (
 	isOnlineMu sync.RWMutex
 	isStarting bool
 	httpClient *http.Client
+
+	// Stats
+	stats     ProxyStats
+	statsFile = getEnv("STATS_FILE", "stats.json")
 )
+
+type PlayerLog struct {
+	Username  string    `json:"username"`
+	Timestamp time.Time `json:"timestamp"`
+	Action    string    `json:"action"`
+}
+
+type ProxyStats struct {
+	TotalPings         uint64      `json:"total_pings"`
+	TotalStartTriggers uint64      `json:"total_start_triggers"`
+	History            []PlayerLog `json:"history"`
+	mu                 sync.Mutex
+}
 
 func init() {
 	tr := &http.Transport{
 		TLSClientConfig: &tls.Config{InsecureSkipVerify: true},
 	}
 	httpClient = &http.Client{Transport: tr, Timeout: 5 * time.Second}
+
+	// Chargement des stats
+	data, err := os.ReadFile(statsFile)
+	if err == nil {
+		json.Unmarshal(data, &stats)
+	} else {
+		stats.History = make([]PlayerLog, 0)
+	}
 }
 
 func getEnv(key, fallback string) string {
@@ -43,6 +71,44 @@ func getEnv(key, fallback string) string {
 		return val
 	}
 	return fallback
+}
+
+func logPlayerAction(username, action string) {
+	stats.mu.Lock()
+	defer stats.mu.Unlock()
+
+	if action == "start_triggered" {
+		stats.TotalStartTriggers++
+	}
+
+	entry := PlayerLog{
+		Username:  username,
+		Timestamp: time.Now(),
+		Action:    action,
+	}
+	stats.History = append(stats.History, entry)
+	if len(stats.History) > 50 {
+		stats.History = stats.History[1:]
+	}
+
+	bytesData, err := json.MarshalIndent(stats, "", "  ")
+	if err == nil {
+		_ = os.WriteFile(statsFile, bytesData, 0644)
+	}
+}
+
+func isPlayerAllowed(username string) bool {
+	allowedList := getEnv("ALLOWED_PLAYERS", "")
+	if allowedList == "" {
+		return true
+	}
+	players := strings.Split(allowedList, ",")
+	for _, p := range players {
+		if strings.EqualFold(strings.TrimSpace(p), strings.TrimSpace(username)) {
+			return true
+		}
+	}
+	return false
 }
 
 // --- Encodage / Décodage Protocole Minecraft ---
@@ -150,7 +216,7 @@ func handleOfflineHandshake(client net.Conn) {
 		return
 	}
 
-	// Hostname (ex: mc.redwally.fr)
+	// Hostname
 	hostLen, err := readVarInt(client)
 	if err != nil || hostLen > 255 {
 		return
@@ -174,12 +240,22 @@ func handleOfflineHandshake(client net.Conn) {
 
 	// --- STATE 1 : STATUS / PING ---
 	if nextState == 1 {
+		stats.mu.Lock()
+		stats.TotalPings++
+		stats.mu.Unlock()
+
 		_, _ = readVarInt(client) // Packet Length
 		_, _ = readVarInt(client) // Packet ID (0x00)
 
 		motd := offlineMOTD
 		versionName := "§cFabric Hors Ligne"
-		if isStarting {
+		
+		isMaintenance := strings.EqualFold(getEnv("MAINTENANCE_MODE", "false"), "true")
+
+		if isMaintenance {
+			motd = strings.ReplaceAll(getEnv("MAINTENANCE_MESSAGE", "§c[Maintenance]\\n§fLe serveur est fermé."), "\\n", "\n")
+			versionName = "§4Maintenance"
+		} else if isStarting {
 			motd = "§6[Démarrage...] §eFabric charge, réessaie dans 15s !"
 			versionName = "§6Démarrage..."
 		}
@@ -207,7 +283,7 @@ func handleOfflineHandshake(client net.Conn) {
 		return
 	}
 
-	// --- STATE 2 : LOGIN (TENTATIVE DE REJOINDRre) ---
+	// --- STATE 2 : LOGIN (TENTATIVE DE REJOINDRE) ---
 	if nextState == 2 {
 		_, _ = readVarInt(client)
 		loginPacketID, _ := readVarInt(client)
@@ -224,6 +300,31 @@ func handleOfflineHandshake(client net.Conn) {
 
 		log.Printf("[CONNEXION] [%s] tente de se connecter via %s", username, client.RemoteAddr())
 
+		isMaintenance := strings.EqualFold(getEnv("MAINTENANCE_MODE", "false"), "true")
+
+		// 1. Vérification Maintenance
+		if isMaintenance && !isPlayerAllowed(username) {
+			log.Printf("[MAINTENANCE] Refusé pour %s", username)
+			logPlayerAction(username, "blocked_maintenance")
+			
+			mMsg := getEnv("MAINTENANCE_MESSAGE", "§c[Maintenance]\\n§fLe serveur est fermé.")
+			jsonKick := fmt.Sprintf(`{"text":"%s"}`, mMsg)
+			_ = sendPacket(client, 0x00, writeString(jsonKick))
+			return
+		}
+
+		// 2. Vérification Whitelist
+		if !isPlayerAllowed(username) {
+			log.Printf("[WHITELIST] Non autorisé : %s", username)
+			logPlayerAction(username, "blocked_whitelist")
+			
+			jsonKick := `{"text":"§cTu n'es pas dans la whitelist de ce serveur."}`
+			_ = sendPacket(client, 0x00, writeString(jsonKick))
+			return
+		}
+
+		// 3. Lancement
+		logPlayerAction(username, "start_triggered")
 		isStarting = true
 		go triggerStart()
 
