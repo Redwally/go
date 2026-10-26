@@ -1,7 +1,6 @@
 package main
 
 import (
-	"bytes"
 	"crypto/tls"
 	"encoding/binary"
 	"fmt"
@@ -24,7 +23,7 @@ var (
 	serverID      = getEnv("CRAFTY_SERVER_ID", "")
 	disconnectMsg = strings.ReplaceAll(getEnv("DISCONNECT_MESSAGE", "§a[AutoStart]\n§eOrdre envoyé à Crafty !\n§fRéessaie dans 15 secondes."), "\\n", "\n")
 	offlineMOTD   = getEnv("OFFLINE_MOTD", "§c[Hors Ligne] §fRejoins pour démarrer le serveur")
-	serverFavicon = getEnv("SERVER_FAVICON", "") // Optionnel: data:image/png;base64,...
+	serverFavicon = getEnv("SERVER_FAVICON", "")
 
 	isOnline   bool
 	isOnlineMu sync.RWMutex
@@ -144,7 +143,10 @@ func handleOfflineHandshake(client net.Conn) {
 		return
 	}
 
-	_ = readVarInt(client) // Protocol Version
+	_, err = readVarInt(client) // Protocol Version
+	if err != nil {
+		return
+	}
 	hostLen, err := readVarInt(client)
 	if err != nil {
 		return
@@ -173,7 +175,6 @@ func handleOfflineHandshake(client net.Conn) {
 			versionName = "§6Démarrage en cours..."
 		}
 
-		// Format JSON du Status Response
 		iconJson := ""
 		if serverFavicon != "" {
 			iconJson = fmt.Sprintf(`,"favicon":"%s"`, serverFavicon)
@@ -202,7 +203,6 @@ func handleOfflineHandshake(client net.Conn) {
 
 	// --- ÉTAPE 2 : TENTATIVE DE CONNEXION DU JOUEUR (Login Start) ---
 	if nextState == 2 {
-		// Lire paquet Login Start (0x00)
 		_, _ = readVarInt(client)
 		loginPacketID, _ := readVarInt(client)
 
@@ -219,11 +219,9 @@ func handleOfflineHandshake(client net.Conn) {
 		playerIP := client.RemoteAddr().String()
 		log.Printf("[CONNEXION] Tentative de connexion de [%s] (IP: %s)", username, playerIP)
 
-		// Déclencher Crafty
 		isStarting = true
 		go triggerStart()
 
-		// Envoi du paquet Disconnect (Login Mode - Packet ID 0x00)
 		jsonKick := fmt.Sprintf(`{"text":"%s"}`, disconnectMsg)
 		sendPacket(client, 0x00, writeString(jsonKick))
 	}
@@ -248,18 +246,15 @@ func handleConnection(client net.Conn) {
 		defer target.Close()
 		defer client.Close()
 
-		// Tunnel TCP natif bidirectionnel ultra-rapide
 		go io.Copy(target, client)
 		io.Copy(client, target)
 		return
 	}
 
-	// Si le serveur est éteint, on traite la demande via le protocole Minecraft
 	handleOfflineHandshake(client)
 }
 
 func main() {
-	// Surveillance en arrière-plan
 	go func() {
 		for {
 			isOnlineMu.RLock()
